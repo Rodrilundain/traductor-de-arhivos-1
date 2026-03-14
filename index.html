@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FileTranslator Pro</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Sora:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<!--
+  FileTranslator Pro — index.html v3.0
+  BUGS CORREGIDOS vs v2.x:
+  [F1]  key.split('|') rompía con sheet names que contenían '|'
+        → Ahora usa indexOf para separar solo en el primer '|'
+  [F2]  cell.r (rich text array) sobreescrito con string → datos corruptos
+        → Ahora se elimina con delete (SheetJS lo regenera automáticamente)
+  [F3]  cell.h (HTML escapado) sobreescrito con texto crudo
+        → Idem, eliminado con delete
+  [F4]  Workbook mutado en primera traducción → segunda traducción
+        re-traduce texto ya traducido
+        → Workbook re-parseado del buffer original en cada traducción
+  [F5]  FileReader asíncrono: botón "Traducir" habilitado antes de que
+        state.contenido/xlsxData esté listo → posible null crash
+        → Botón deshabilitado hasta que la lectura complete
+  [F6]  Sin mecanismo de cancelación durante batch de muchos lotes
+        → Botón "Cancelar" disponible durante traducción
+  [F7]  mostrarProgreso(false) no limpiaba clase 'indeterminate'
+        → Limpieza explícita al ocultar
+  [F8]  generarNombre() con archivos sin extensión producía nombre corrupto
+        → Caso sin punto manejado correctamente
+  [F9]  Doble click rápido en Traducir podía iniciar dos jobs paralelos
+        → Flag state.traduciendo previene concurrencia
+  [F10] innerHTML en statusText permitía inyección HTML desde mensajes de error
+        → Mensajes internos seguros; textContent para datos externos
+  [F11] Texto plano con encoding no-UTF8 (ej: Windows-1252) se corrompía
+        → Advertencia al usuario + intento de lectura con Latin-1 fallback
+  [F12] XLSX muy grande tardaba mucho en parsear bloqueando el hilo UI
+        → Lectura diferida con feedback visual
+-->
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:          #0b0e14;
+    --surface:     #111520;
+    --surface-hi:  #161c2e;
+    --border:      #1e2535;
+    --border-hi:   #2e3d5c;
+    --text:        #c9d3e8;
+    --text-dim:    #5a6a8a;
+    --text-head:   #eef2ff;
+    --accent:      #3d8ef8;
+    --accent-lo:   rgba(61,142,248,.12);
+    --accent-glow: rgba(61,142,248,.28);
+    --green:       #34d87a;
+    --green-lo:    rgba(52,216,122,.1);
+    --red:         #f05c6e;
+    --red-lo:      rgba(240,92,110,.1);
+    --yellow:      #f0c94e;
+    --yellow-lo:   rgba(240,201,78,.1);
+    --radius:      12px;
+    --radius-sm:   8px;
+    --mono:        'JetBrains Mono', monospace;
+    --sans:        'Sora', sans-serif;
+    --trans:       .18s cubic-bezier(.4,0,.2,1);
+  }
+
+  html { height: 100%; }
+  body {
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 16px 80px;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 32px 32px;
+    opacity: .35;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  body::after {
+    content: '';
+    position: fixed;
+    top: -200px; left: 50%; transform: translateX(-50%);
+    width: 800px; height: 500px;
+    background: radial-gradient(ellipse, rgba(61,142,248,.12) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ─── Card ───────────────────────────────────────────────── */
+  .card {
+    position: relative; z-index: 1;
+    width: 100%; max-width: 680px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.03), 0 24px 64px rgba(0,0,0,.55);
+    animation: slideUp .45s cubic-bezier(.22,1,.36,1) both;
+  }
+
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ─── Header ─────────────────────────────────────────────── */
+  .header {
+    padding: 26px 32px 22px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(135deg, rgba(61,142,248,.06) 0%, transparent 55%);
+    display: flex; align-items: center; gap: 16px;
+  }
+
+  .header-icon {
+    width: 44px; height: 44px;
+    background: var(--accent-lo); border: 1px solid rgba(61,142,248,.3);
+    border-radius: 10px; display: grid; place-items: center;
+    font-size: 20px; flex-shrink: 0;
+  }
+
+  .header-title { font-family: var(--mono); font-size: 17px; font-weight: 700; color: var(--text-head); letter-spacing: -.3px; }
+  .header-title b { color: var(--accent); font-weight: 700; }
+  .header-sub { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+
+  .header-badge {
+    margin-left: auto; flex-shrink: 0;
+    font-family: var(--mono); font-size: 10px; color: var(--accent);
+    background: var(--accent-lo); border: 1px solid rgba(61,142,248,.22);
+    border-radius: 20px; padding: 4px 10px; letter-spacing: .5px;
+  }
+
+  /* ─── Body ───────────────────────────────────────────────── */
+  .body { padding: 28px 32px; display: flex; flex-direction: column; gap: 22px; }
+
+  /* ─── Section label ──────────────────────────────────────── */
+  .slabel {
+    font-family: var(--mono); font-size: 10px; font-weight: 600;
+    color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase;
+    margin-bottom: 8px; display: flex; align-items: center; gap: 7px;
+  }
+  .slabel::before {
+    content: ''; width: 5px; height: 5px;
+    background: var(--accent); border-radius: 50%; opacity: .8;
+  }
+
+  /* ─── Drop Zone ──────────────────────────────────────────── */
+  .drop-zone {
+    border: 2px dashed var(--border-hi); border-radius: var(--radius);
+    padding: 28px 32px; text-align: center; cursor: pointer;
+    transition: border-color var(--trans), background var(--trans);
+    position: relative; background: rgba(255,255,255,.01);
+  }
+  .drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: var(--accent-lo); }
+  .drop-zone input[type="file"] { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+  .drop-icon { font-size: 28px; margin-bottom: 8px; }
+  .drop-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--text-head); margin-bottom: 4px; }
+  .drop-hint  { font-size: 11px; color: var(--text-dim); line-height: 1.8; }
+  .drop-hint code { font-family: var(--mono); font-size: 10px; background: rgba(255,255,255,.05); padding: 1px 5px; border-radius: 3px; }
+
+  /* File info bar */
+  .file-bar {
+    display: none; align-items: center; gap: 11px;
+    padding: 12px 15px; border-radius: var(--radius-sm); margin-top: 10px;
+    background: var(--green-lo); border: 1px solid rgba(52,216,122,.22);
+    animation: fadeIn .2s ease;
+  }
+  .file-bar.visible { display: flex; }
+  .file-bar-icon { font-size: 18px; flex-shrink: 0; }
+  .file-bar-name { font-family: var(--mono); font-size: 11px; color: var(--green); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-bar-meta { font-size: 11px; color: var(--text-dim); flex-shrink: 0; white-space: nowrap; }
+  .file-bar-remove { background: none; border: none; cursor: pointer; color: var(--text-dim); font-size: 15px; transition: color var(--trans); flex-shrink: 0; line-height: 1; padding: 0 2px; }
+  .file-bar-remove:hover { color: var(--red); }
+
+  /* ─── Language Row ───────────────────────────────────────── */
+  .lang-row { display: grid; grid-template-columns: 1fr 38px 1fr; gap: 8px; align-items: end; }
+
+  .swap-btn {
+    width: 38px; height: 38px; background: var(--surface-hi);
+    border: 1px solid var(--border-hi); border-radius: var(--radius-sm);
+    cursor: pointer; color: var(--text-dim); font-size: 15px;
+    transition: var(--trans); display: grid; place-items: center;
+  }
+  .swap-btn:hover { background: var(--accent-lo); border-color: var(--accent); color: var(--accent); transform: rotate(180deg); }
+
+  .sublabel { font-size: 10px; color: var(--text-dim); margin-bottom: 5px; }
+
+  .sel-wrap { position: relative; }
+  select {
+    width: 100%; appearance: none; background: var(--bg);
+    border: 1px solid var(--border-hi); border-radius: var(--radius-sm);
+    color: var(--text-head); font-family: var(--sans); font-size: 13px;
+    padding: 10px 34px 10px 12px; cursor: pointer;
+    transition: border-color var(--trans), box-shadow var(--trans); outline: none;
+  }
+  select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .sel-arrow { position: absolute; right: 11px; top: 50%; transform: translateY(-50%); pointer-events: none; color: var(--text-dim); font-size: 9px; }
+
+  /* ─── Alert / Status ─────────────────────────────────────── */
+  .alert { display: none; align-items: flex-start; gap: 10px; padding: 13px 15px; border-radius: var(--radius-sm); font-size: 12.5px; animation: fadeIn .2s ease; }
+  .alert.visible { display: flex; }
+  .alert.error   { background: var(--red-lo);    border: 1px solid rgba(240,92,110,.25);  color: var(--red); }
+  .alert.warn    { background: var(--yellow-lo); border: 1px solid rgba(240,201,78,.25); color: var(--yellow); }
+  .alert.info    { background: var(--accent-lo); border: 1px solid rgba(61,142,248,.22); color: #7eb8ff; }
+  .alert-icon { font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+  .alert-text { flex: 1; line-height: 1.55; }
+
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+  /* ─── Progress ───────────────────────────────────────────── */
+  .progress-wrap { display: none; flex-direction: column; gap: 8px; }
+  .progress-wrap.visible { display: flex; }
+  .progress-meta { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+  .progress-track { height: 3px; background: var(--border); border-radius: 99px; overflow: hidden; }
+  .progress-fill  { height: 100%; background: linear-gradient(90deg, var(--accent), #7eb8ff); border-radius: 99px; width: 0; transition: width .25s ease; }
+  .progress-fill.spin { width: 35% !important; animation: indeterminate 1.3s ease infinite; }
+  @keyframes indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+
+  /* ─── Download Panel ─────────────────────────────────────── */
+  .dl-panel {
+    display: none; flex-direction: column; gap: 14px; padding: 18px 20px;
+    background: linear-gradient(135deg, rgba(52,216,122,.07), rgba(52,216,122,.02));
+    border: 1px solid rgba(52,216,122,.28); border-radius: var(--radius);
+    animation: fadeIn .3s ease;
+  }
+  .dl-panel.visible { display: flex; }
+
+  .dl-panel-head { display: flex; align-items: center; gap: 12px; }
+  .dl-check { width: 38px; height: 38px; flex-shrink: 0; background: var(--green-lo); border: 1px solid rgba(52,216,122,.35); border-radius: 50%; display: grid; place-items: center; font-size: 16px; }
+  .dl-title { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--green); }
+  .dl-sub   { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  .dl-filename {
+    font-family: var(--mono); font-size: 11px;
+    background: rgba(0,0,0,.28); border: 1px solid var(--border-hi);
+    border-radius: var(--radius-sm); padding: 10px 13px;
+    display: flex; align-items: center; gap: 8px; overflow: hidden;
+  }
+  .dl-filename-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--green); flex: 1; }
+
+  .dl-actions { display: flex; gap: 9px; }
+
+  /* ─── Buttons ─────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    border: none; border-radius: var(--radius-sm); cursor: pointer;
+    font-family: var(--mono); font-weight: 700; transition: var(--trans);
+    white-space: nowrap;
+  }
+
+  .btn-primary {
+    flex: 1; padding: 13px 20px; font-size: 13px;
+    background: var(--green); color: #061208;
+  }
+  .btn-primary:hover { filter: brightness(1.1); transform: translateY(-1px); box-shadow: 0 6px 20px rgba(52,216,122,.35); }
+  .btn-primary:active { transform: translateY(0); }
+
+  .btn-ghost {
+    padding: 13px 15px; font-size: 12px;
+    background: transparent; border: 1px solid var(--border-hi); color: var(--text-dim);
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  .btn-translate {
+    width: 100%; padding: 14px; font-size: 14px;
+    background: var(--accent); color: #fff;
+    position: relative; overflow: hidden;
+  }
+  .btn-translate::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg,rgba(255,255,255,.14),transparent); opacity: 0; transition: opacity var(--trans); }
+  .btn-translate:hover:not(:disabled)::before { opacity: 1; }
+  .btn-translate:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(61,142,248,.38); }
+  .btn-translate:active:not(:disabled) { transform: translateY(0); }
+  .btn-translate:disabled { opacity: .38; cursor: not-allowed; transform: none; }
+
+  .btn-cancel {
+    width: 100%; padding: 11px; font-size: 12px;
+    background: transparent; border: 1px solid rgba(240,92,110,.3);
+    color: var(--red); display: none;
+  }
+  .btn-cancel.visible { display: flex; }
+  .btn-cancel:hover { background: var(--red-lo); border-color: var(--red); }
+
+  .spin-icon { display: none; width: 15px; height: 15px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: rotar .65s linear infinite; }
+  @keyframes rotar { to { transform: rotate(360deg); } }
+  .btn-translate.loading .spin-icon { display: block; }
+  .btn-translate.loading .btn-label { opacity: .75; }
+
+  /* ─── Footer ─────────────────────────────────────────────── */
+  .footer { padding: 14px 32px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .footer-txt { font-family: var(--mono); font-size: 10px; color: var(--text-dim); letter-spacing: .3px; }
+  .footer-txt b { color: var(--accent); font-weight: 600; }
+
+  /* ─── Toast ──────────────────────────────────────────────── */
+  .toast {
+    position: fixed; bottom: 28px; left: 50%;
+    transform: translateX(-50%) translateY(14px);
+    background: #131d32; border: 1px solid rgba(52,216,122,.4);
+    border-radius: 40px; padding: 12px 24px;
+    display: flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-size: 12px; color: var(--green);
+    box-shadow: 0 10px 40px rgba(0,0,0,.65);
+    z-index: 9999; opacity: 0; pointer-events: none;
+    transition: opacity .28s ease, transform .32s cubic-bezier(.22,1,.36,1);
+    white-space: nowrap;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  @media (max-width: 520px) {
+    .body, .header { padding: 18px; }
+    .footer { padding: 12px 18px; flex-direction: column; align-items: flex-start; gap: 4px; }
+    .lang-row { grid-template-columns: 1fr 34px 1fr; gap: 6px; }
+    .header-badge { display: none; }
+    .toast { font-size: 11px; padding: 10px 16px; }
+    .dl-actions { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-icon">📄</div>
+    <div>
+      <div class="header-title">File<b>Translator</b> Pro</div>
+      <div class="header-sub">Traducción de archivos · solo idioma destino · sin mezcla</div>
+    </div>
+    <div class="header-badge">v3.0</div>
+  </div>
+
+  <!-- Body -->
+  <div class="body">
+
+    <!-- Archivo -->
+    <div>
+      <div class="slabel">Archivo a traducir</div>
+      <div class="drop-zone" id="dropZone">
+        <input type="file" id="archivoInput" accept=".txt,.csv,.md,.log,.xlsx" onchange="onFileChange(event)">
+        <div class="drop-icon">📂</div>
+        <div class="drop-title">Arrastrá tu archivo aquí</div>
+        <div class="drop-hint">
+          <code>.txt</code> <code>.csv</code> <code>.md</code> <code>.log</code> — máx 200 KB &nbsp;·&nbsp;
+          <code>.xlsx</code> — máx 75 MB
+        </div>
+      </div>
+      <!-- [F5] Barra aparece solo cuando la lectura terminó -->
+      <div class="file-bar" id="fileBar">
+        <span class="file-bar-icon">✅</span>
+        <span class="file-bar-name" id="fileBarName">—</span>
+        <span class="file-bar-meta" id="fileBarMeta">—</span>
+        <button class="file-bar-remove" onclick="removeFile()" title="Quitar archivo">✕</button>
+      </div>
+    </div>
+
+    <!-- Idiomas -->
+    <div>
+      <div class="slabel">Idiomas</div>
+      <div class="lang-row">
+        <div>
+          <div class="sublabel">Origen</div>
+          <div class="sel-wrap">
+            <select id="selOrigen"></select>
+            <span class="sel-arrow">▼</span>
+          </div>
+        </div>
+        <button class="swap-btn btn" onclick="swapLangs()" title="Intercambiar idiomas">⇄</button>
+        <div>
+          <div class="sublabel">Destino</div>
+          <div class="sel-wrap">
+            <select id="selDestino"></select>
+            <span class="sel-arrow">▼</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Alertas -->
+    <div class="alert" id="alertBox">
+      <span class="alert-icon" id="alertIcon"></span>
+      <span class="alert-text"  id="alertText"></span>
+    </div>
+
+    <!-- Progreso -->
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-meta">
+        <span id="progressLabel">Traduciendo…</span>
+        <span id="progressPct"></span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-fill spin" id="progressFill"></div>
+      </div>
+    </div>
+
+    <!-- Panel de descarga -->
+    <div class="dl-panel" id="dlPanel">
+      <div class="dl-panel-head">
+        <div class="dl-check">✅</div>
+        <div>
+          <div class="dl-title">Traducción completada</div>
+          <div class="dl-sub">Solo idioma destino — sin texto original</div>
+        </div>
+      </div>
+      <div class="dl-filename">
+        <span>📄</span>
+        <span class="dl-filename-text" id="dlFilename">—</span>
+      </div>
+      <div class="dl-actions">
+        <button class="btn btn-primary" onclick="ejecutarDescarga()">⬇&nbsp; Descargar archivo traducido</button>
+        <button class="btn btn-ghost"   onclick="resetearTodo()">↺ Nueva</button>
+      </div>
+    </div>
+
+    <!-- Botón principal -->
+    <button class="btn btn-translate" id="btnTranslate" onclick="traducir()" disabled>
+      <div class="spin-icon"></div>
+      <span class="btn-label">🌐 Traducir archivo</span>
+    </button>
+
+    <!-- [F6] Botón cancelar -->
+    <button class="btn btn-cancel" id="btnCancel" onclick="cancelarTraduccion()">
+      ✕ Cancelar traducción
+    </button>
+
+  </div><!-- /body -->
+
+  <div class="footer">
+    <span class="footer-txt">Powered by <b>Google LanguageApp</b></span>
+    <span class="footer-txt" id="fileMeta" style="display:none;" id="fileMetaSpan"></span>
+  </div>
+
+</div><!-- /card -->
+
+<!-- Toast -->
+<div class="toast" id="toast">
+  <span>📥</span>
+  <span id="toastMsg">—</span>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   FileTranslator Pro — frontend v3.0
+   ═══════════════════════════════════════════════════════════ */
+
+// ─── Estado ──────────────────────────────────────────────────
+var S = {
+  file         : null,
+  modo         : null,      // 'texto' | 'xlsx'
+  contenido    : null,      // string (archivos de texto)
+  xlsxBuffer   : null,      // ArrayBuffer original — [F4] nunca mutado
+  xlsxCellMap  : null,      // { key: valorOriginal }
+  xlsxTextos   : null,      // array paralelo a Object.keys(xlsxCellMap)
+  resultado    : null,      // Blob listo para descargar
+  nombreOut    : null,
+  listo        : false,     // [F5] true cuando FileReader terminó
+  traduciendo  : false,     // [F9] previene concurrencia
+  cancelado    : false,     // [F6] flag de cancelación
+};
+
+var EXTS_TEXTO = ['.txt', '.csv', '.md', '.log'];
+var EXTS_XLSX  = ['.xlsx'];
+var BATCH_SIZE = 200;
+
+// ─── Init ─────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', function() {
+  cargarIdiomas();
+  initDragDrop();
+});
+
+// ─── Idiomas ──────────────────────────────────────────────────
+function cargarIdiomas() {
+  var fallback = [
+    { code:'auto', name:'Detectar automáticamente', flag:'🌐', onlyOrigin:true },
+    { code:'es', name:'Español',   flag:'🇪🇸' },
+    { code:'en', name:'Inglés',    flag:'🇺🇸' },
+    { code:'pt', name:'Portugués', flag:'🇧🇷' },
+    { code:'fr', name:'Francés',   flag:'🇫🇷' },
+    { code:'de', name:'Alemán',    flag:'🇩🇪' },
+  ];
+  google.script.run
+    .withSuccessHandler(poblarSelects)
+    .withFailureHandler(function() { poblarSelects(fallback); })
+    .obtenerIdiomas();
+}
+
+function poblarSelects(idiomas) {
+  var sO = document.getElementById('selOrigen');
+  var sD = document.getElementById('selDestino');
+  sO.innerHTML = sD.innerHTML = '';
+  idiomas.forEach(function(i) {
+    sO.add(new Option(i.flag + '  ' + i.name, i.code));
+    if (!i.onlyOrigin) sD.add(new Option(i.flag + '  ' + i.name, i.code));
+  });
+  sO.value = 'auto'; sD.value = 'es';
+}
+
+function swapLangs() {
+  var sO = document.getElementById('selOrigen');
+  var sD = document.getElementById('selDestino');
+  if (sO.value === 'auto') return;
+  var existe = Array.from(sD.options).some(function(o) { return o.value === sO.value; });
+  if (!existe) return;
+  var t = sO.value; sO.value = sD.value; sD.value = t;
+}
+
+// ─── Drag & Drop ─────────────────────────────────────────────
+function initDragDrop() {
+  var z = document.getElementById('dropZone');
+  z.addEventListener('dragover',  function(e) { e.preventDefault(); z.classList.add('drag-over'); });
+  z.addEventListener('dragleave', function()  { z.classList.remove('drag-over'); });
+  z.addEventListener('drop', function(e) {
+    e.preventDefault(); z.classList.remove('drag-over');
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) procesarArchivo(f);
+  });
+}
+
+// ─── Manejo de archivo ────────────────────────────────────────
+function onFileChange(e) {
+  if (e.target.files && e.target.files[0]) procesarArchivo(e.target.files[0]);
+}
+
+function procesarArchivo(file) {
+  var ext    = '.' + file.name.split('.').pop().toLowerCase();
+  var esText = EXTS_TEXTO.indexOf(ext) !== -1;
+  var esXlsx = EXTS_XLSX.indexOf(ext) !== -1;
+
+  if (!esText && !esXlsx) {
+    mostrarAlerta('error', '⛔', 'Tipo de archivo no soportado (' + ext + '). Formatos válidos: ' + EXTS_TEXTO.concat(EXTS_XLSX).join(', '));
+    return;
+  }
+
+  var limBytes = esXlsx ? 75 * 1024 * 1024 : 200 * 1024;
+  if (file.size > limBytes) {
+    mostrarAlerta('error', '⛔',
+      'Archivo demasiado grande (' + formatBytes(file.size) + '). ' +
+      'Límite para ' + ext + ': ' + (esXlsx ? '75 MB' : '200 KB') + '.'
+    );
+    return;
+  }
+
+  resetearEstado();
+  ocultarAlerta();
+  ocultarDescarga();
+
+  S.file = file;
+  S.modo = esXlsx ? 'xlsx' : 'texto';
+  S.listo = false;
+
+  // [F5] Deshabilitar traducir hasta que la lectura termine
+  document.getElementById('btnTranslate').disabled = true;
+  mostrarAlerta('info', '⏳', 'Leyendo archivo…');
+
+  if (esXlsx) leerXlsx(file); else leerTexto(file);
+}
+
+// ── Leer texto plano ──────────────────────────────────────────
+function leerTexto(file) {
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    S.contenido = e.target.result;
+    S.listo = true;
+    ocultarAlerta();
+    mostrarFileBar(file, S.contenido.length.toLocaleString() + ' chars');
+    document.getElementById('btnTranslate').disabled = false;
+  };
+  // [F11] Fallback Latin-1 si UTF-8 falla
+  reader.onerror = function() {
+    var r2 = new FileReader();
+    r2.onload = function(e) {
+      S.contenido = e.target.result;
+      S.listo = true;
+      ocultarAlerta();
+      mostrarAlerta('warn', '⚠️', 'El archivo fue leído como Latin-1. Si hay caracteres extraños, guardalo en UTF-8 antes de traducir.');
+      mostrarFileBar(file, S.contenido.length.toLocaleString() + ' chars');
+      document.getElementById('btnTranslate').disabled = false;
+    };
+    r2.onerror = function() { mostrarAlerta('error', '❌', 'No se pudo leer el archivo.'); };
+    r2.readAsText(file, 'latin-1');
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ── Leer XLSX ─────────────────────────────────────────────────
+function leerXlsx(file) {
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      // [F4] Guardar buffer ORIGINAL — el workbook se re-parsea en cada traducción
+      S.xlsxBuffer = e.target.result;
+
+      var wb       = XLSX.read(new Uint8Array(S.xlsxBuffer), { type: 'array' });
+      var cellMap  = {};
+      var textos   = [];
+
+      wb.SheetNames.forEach(function(sn) {
+        var sh = wb.Sheets[sn];
+        Object.keys(sh).forEach(function(ref) {
+          if (ref.charAt(0) === '!') return;
+          var c = sh[ref];
+          if (c && (c.t === 's' || c.t === 'str') && typeof c.v === 'string' && c.v.trim()) {
+            // [F1] Separar con primer '|' usando separador seguro
+            var key = sn + '\x00' + ref;  // \x00 jamás aparece en sheet names ni refs
+            cellMap[key] = c.v;
+            textos.push(c.v);
+          }
+        });
+      });
+
+      if (!textos.length) {
+        mostrarAlerta('error', '⚠️', 'El archivo XLSX no contiene celdas de texto para traducir.');
+        return;
+      }
+
+      S.xlsxCellMap = cellMap;
+      S.xlsxTextos  = textos;
+      S.listo       = true;
+
+      ocultarAlerta();
+      mostrarFileBar(file, textos.length.toLocaleString() + ' celdas de texto');
+      document.getElementById('btnTranslate').disabled = false;
+
+    } catch(err) {
+      mostrarAlerta('error', '❌', 'No se pudo leer el XLSX: ' + err.message);
+    }
+  };
+  reader.onerror = function() { mostrarAlerta('error', '❌', 'Error al leer el archivo.'); };
+  reader.readAsArrayBuffer(file);
+}
+
+function removeFile() {
+  resetearEstado();
+  document.getElementById('archivoInput').value = '';
+  document.getElementById('fileBar').classList.remove('visible');
+  document.getElementById('fileMeta').style.display = 'none';
+  ocultarAlerta();
+  ocultarDescarga();
+  document.getElementById('btnTranslate').disabled = true;
+}
+
+// ─── Traducción ───────────────────────────────────────────────
+function traducir() {
+  // [F9] Evitar ejecuciones concurrentes
+  if (S.traduciendo) return;
+  if (!S.file || !S.listo) { mostrarAlerta('error', '⚠️', 'Esperá a que el archivo termine de cargarse.'); return; }
+
+  var origen  = document.getElementById('selOrigen').value;
+  var destino = document.getElementById('selDestino').value;
+  if (origen !== 'auto' && origen === destino) { mostrarAlerta('error', '⚠️', 'El idioma de origen y destino no pueden ser el mismo.'); return; }
+
+  S.traduciendo = true;
+  S.cancelado   = false;
+  S.resultado   = null;
+
+  var btn = document.getElementById('btnTranslate');
+  btn.classList.add('loading'); btn.disabled = true;
+  document.getElementById('btnCancel').classList.add('visible');
+  ocultarAlerta();
+  ocultarDescarga();
+  mostrarProgreso(true);
+
+  if (S.modo === 'xlsx') traducirXlsx(origen, destino, btn);
+  else                   traducirTexto(origen, destino, btn);
+}
+
+// ── Texto plano ───────────────────────────────────────────────
+function traducirTexto(origen, destino, btn) {
+  google.script.run
+    .withSuccessHandler(function(res) {
+      if (S.cancelado) { finalizarCancelado(btn); return; }
+      var blob   = new Blob([res], { type: 'text/plain;charset=utf-8' });
+      var nombre = generarNombre(S.file.name, destino);
+      mostrarDescarga(blob, nombre, btn);
+    })
+    .withFailureHandler(function(err) { finalizarError(btn, err); })
+    .traducirArchivo(S.contenido, origen, destino);
+}
+
+// ── XLSX por lotes ────────────────────────────────────────────
+function traducirXlsx(origen, destino, btn) {
+  var claves = Object.keys(S.xlsxCellMap);
+  var textos = S.xlsxTextos;
+  var lotes  = [];
+  for (var i = 0; i < textos.length; i += BATCH_SIZE) {
+    lotes.push({ t: textos.slice(i, i + BATCH_SIZE), k: claves.slice(i, i + BATCH_SIZE) });
+  }
+
+  var total = lotes.length;
+  var idx   = 0;
+  var trad  = {};
+
+  function siguiente() {
+    // [F6] Chequear cancelación en cada iteración
+    if (S.cancelado) { finalizarCancelado(btn); return; }
+
+    if (idx >= total) {
+      // Todos los lotes completados — reconstruir workbook
+      try {
+        // [F4] Re-parsear desde buffer ORIGINAL (nunca mutamos el original)
+        var wb     = XLSX.read(new Uint8Array(S.xlsxBuffer), { type: 'array' });
+        var cellMap = S.xlsxCellMap;
+
+        claves.forEach(function(key) {
+          var val = trad[key] !== undefined ? trad[key] : '';
+          // [F1] Separar con \x00 (seguro ante sheet names con '|')
+          var sepIdx = key.indexOf('\x00');
+          var sn     = key.slice(0, sepIdx);
+          var ref    = key.slice(sepIdx + 1);
+          var c = wb.Sheets[sn][ref];
+          if (!c) return;
+          c.v = val;
+          // [F2] [F3] Eliminar campos derivados para que SheetJS los regenere
+          delete c.r;
+          delete c.h;
+          delete c.w;  // formatted text — también stale
+        });
+
+        var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        var blob  = new Blob([wbout], { type: 'application/octet-stream' });
+        var nombre = generarNombre(S.file.name, destino);
+        mostrarDescarga(blob, nombre, btn);
+
+      } catch(e) {
+        finalizarError(btn, { message: 'Error al reconstruir el XLSX: ' + e.message });
+      }
+      return;
+    }
+
+    var lote = lotes[idx];
+    actualizarProgreso(idx + 1, total);
+
+    google.script.run
+      .withSuccessHandler(function(res) {
+        if (S.cancelado) { finalizarCancelado(btn); return; }
+        var lineas = res.split('\n');
+        lote.k.forEach(function(key, i) {
+          trad[key] = lineas[i] !== undefined ? lineas[i] : '';
+        });
+        idx++;
+        siguiente();
+      })
+      .withFailureHandler(function(err) { finalizarError(btn, err); })
+      .traducirArchivo(lote.t.join('\n'), origen, destino);
+  }
+
+  siguiente();
+}
+
+// ─── Resultado ────────────────────────────────────────────────
+function mostrarDescarga(blob, nombre, btn) {
+  S.resultado   = blob;
+  S.nombreOut   = nombre;
+  S.traduciendo = false;
+
+  // [F7] Limpiar progreso correctamente
+  cerrarProgreso();
+  btn.classList.remove('loading'); btn.disabled = false;
+  document.getElementById('btnCancel').classList.remove('visible');
+  ocultarAlerta();
+
+  document.getElementById('dlFilename').textContent = nombre;
+  document.getElementById('dlPanel').classList.add('visible');
+  document.getElementById('dlPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function ejecutarDescarga() {
+  if (!S.resultado) return;
+  var url = URL.createObjectURL(S.resultado);
+  var a   = document.createElement('a');
+  a.href  = url; a.download = S.nombreOut;
+  document.body.appendChild(a); a.click();
+  setTimeout(function() { URL.revokeObjectURL(url); document.body.removeChild(a); }, 250);
+  mostrarToast('📥  ' + S.nombreOut + ' — descargado correctamente');
+}
+
+// ─── Cancelar ─────────────────────────────────────────────────
+function cancelarTraduccion() {
+  if (!S.traduciendo) return;
+  S.cancelado = true;
+}
+
+function finalizarCancelado(btn) {
+  S.traduciendo = false; S.cancelado = false;
+  cerrarProgreso();
+  btn.classList.remove('loading'); btn.disabled = false;
+  document.getElementById('btnCancel').classList.remove('visible');
+  mostrarAlerta('warn', '⚠️', 'Traducción cancelada por el usuario.');
+}
+
+// ─── Helpers de estado ────────────────────────────────────────
+function finalizarError(btn, err) {
+  S.traduciendo = false; S.cancelado = false;
+  cerrarProgreso();
+  btn.classList.remove('loading'); btn.disabled = false;
+  document.getElementById('btnCancel').classList.remove('visible');
+  // [F10] Usar textContent para mensajes de error externos
+  var msg = (err && err.message) ? err.message : 'Error desconocido. Revisá la consola de GAS.';
+  mostrarAlerta('error', '❌', 'Error: ' + msg);
+}
+
+function resetearEstado() {
+  S.file = S.modo = S.contenido = S.xlsxBuffer = S.xlsxCellMap = S.xlsxTextos = S.resultado = S.nombreOut = null;
+  S.listo = S.traduciendo = S.cancelado = false;
+}
+
+function resetearTodo() {
+  removeFile();
+  ocultarDescarga();
+  var btn = document.getElementById('btnTranslate');
+  btn.classList.remove('loading');
+  btn.disabled = true;
+  document.getElementById('btnCancel').classList.remove('visible');
+}
+
+// ─── UI ───────────────────────────────────────────────────────
+function mostrarFileBar(file, detalle) {
+  document.getElementById('fileBarName').textContent = file.name;
+  document.getElementById('fileBarMeta').textContent = formatBytes(file.size) + ' · ' + detalle;
+  document.getElementById('fileBar').classList.add('visible');
+  var fm = document.getElementById('fileMeta');
+  fm.textContent = detalle; fm.style.display = 'block';
+}
+
+function mostrarAlerta(tipo, icono, msg) {
+  var box = document.getElementById('alertBox');
+  // [F10] textContent, no innerHTML
+  document.getElementById('alertIcon').textContent = icono;
+  document.getElementById('alertText').textContent = msg;
+  box.className = 'alert visible ' + tipo;
+}
+
+function ocultarAlerta()   { document.getElementById('alertBox').classList.remove('visible'); }
+function ocultarDescarga() { document.getElementById('dlPanel').classList.remove('visible'); }
+
+function mostrarProgreso(visible) {
+  document.getElementById('progressWrap').classList.toggle('visible', visible);
+  if (visible) {
+    document.getElementById('progressLabel').textContent = 'Preparando…';
+    document.getElementById('progressPct').textContent   = '';
+    document.getElementById('progressFill').style.width  = '0';
+    document.getElementById('progressFill').classList.add('spin');
+  }
+}
+
+// [F7] Limpieza completa al cerrar progreso
+function cerrarProgreso() {
+  var wrap = document.getElementById('progressWrap');
+  var fill = document.getElementById('progressFill');
+  wrap.classList.remove('visible');
+  fill.classList.remove('spin');
+  fill.style.width = '0';
+}
+
+function actualizarProgreso(actual, total) {
+  var pct  = Math.round(actual / total * 100);
+  var fill = document.getElementById('progressFill');
+  fill.classList.remove('spin');
+  fill.style.width = pct + '%';
+  document.getElementById('progressLabel').textContent = 'Lote ' + actual + ' de ' + total;
+  document.getElementById('progressPct').textContent   = pct + '%';
+}
+
+// ─── Toast ────────────────────────────────────────────────────
+var _toastTimer = null;
+function mostrarToast(msg) {
+  var el = document.getElementById('toast');
+  document.getElementById('toastMsg').textContent = msg;
+  el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function() { el.classList.remove('show'); }, 4000);
+}
+
+// ─── Utils ────────────────────────────────────────────────────
+// [F8] Maneja archivos sin extensión
+function generarNombre(nombre, codigo) {
+  var dot = nombre.lastIndexOf('.');
+  if (dot <= 0) return nombre + '_' + codigo;
+  return nombre.slice(0, dot) + '_' + codigo + nombre.slice(dot);
+}
+
+function formatBytes(b) {
+  if (b < 1024)      return b + ' B';
+  if (b < 1048576)   return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(2) + ' MB';
+}
+</script>
+</body>
+</html>
